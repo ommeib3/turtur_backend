@@ -2,13 +2,319 @@
 const express = require('express')
 const axios = require('axios')
 const cors = require('cors')
+const crypto = require('crypto')
+const Database = require('better-sqlite3')
+const path = require('path')
+const fs = require('fs')
+const multer = require('multer')
 
 // === НАСТРОЙКА СЕРВЕРА ===
 const app = express()
 app.use(cors())
 app.use(express.json())
 
+// === ЗАГРУЗКА ФОТО ===
+const uploadsDir = path.join(__dirname, 'uploads', 'tourist-photos')
+const excursionUploadsDir = path.join(__dirname, 'uploads', 'excursion-photos')
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true })
+if (!fs.existsSync(excursionUploadsDir)) fs.mkdirSync(excursionUploadsDir, { recursive: true })
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dest = req._uploadDest || uploadsDir
+    cb(null, dest)
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname) || '.jpg'
+    cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`)
+  }
+})
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /\.(jpg|jpeg|png|webp|gif)$/i
+    if (allowed.test(path.extname(file.originalname))) cb(null, true)
+    else cb(new Error('Only image files allowed'))
+  }
+})
+
 // === КОНФИГУРАЦИЯ API ===
+
+// === ADMIN БД (SQLite) ===
+const db = new Database(path.join(__dirname, 'admin.db'))
+db.pragma('journal_mode = WAL')
+
+// Создаём таблицы
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS admin_hotels (
+    hotel_id TEXT PRIMARY KEY,
+    is_special INTEGER DEFAULT 0,
+    reviews_url TEXT DEFAULT '',
+    custom_description TEXT DEFAULT '',
+    custom_tags TEXT DEFAULT '[]',
+    pros TEXT DEFAULT '[]',
+    cons TEXT DEFAULT '[]'
+  );
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS procon_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    icon TEXT DEFAULT ''
+  );
+  CREATE TABLE IF NOT EXISTS tag_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    icon TEXT DEFAULT '',
+    bg_color TEXT DEFAULT 'bg-sea/10',
+    text_color TEXT DEFAULT 'text-sea',
+    border_color TEXT DEFAULT 'border-sea/30'
+  );
+  CREATE TABLE IF NOT EXISTS excursions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    photos TEXT DEFAULT '[]',
+    regions TEXT DEFAULT '[]',
+    section TEXT DEFAULT 'historical',
+    price_usd REAL DEFAULT 0,
+    duration TEXT DEFAULT '',
+    short_description TEXT DEFAULT '',
+    full_description TEXT DEFAULT '',
+    is_recommended INTEGER DEFAULT 0,
+    is_nearby INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT 0
+  );
+`)
+
+// Миграция: добавляем новые колонки если их нет
+try { db.exec(`ALTER TABLE admin_hotels ADD COLUMN pros TEXT DEFAULT '[]'`) } catch {}
+try { db.exec(`ALTER TABLE admin_hotels ADD COLUMN cons TEXT DEFAULT '[]'`) } catch {}
+try { db.exec(`ALTER TABLE tag_presets ADD COLUMN color TEXT DEFAULT '#0891b2'`) } catch {}
+try { db.exec(`ALTER TABLE admin_hotels ADD COLUMN quotes TEXT DEFAULT '[]'`) } catch {}
+try { db.exec(`ALTER TABLE admin_hotels ADD COLUMN tourist_photos TEXT DEFAULT '[]'`) } catch {}
+try { db.exec(`ALTER TABLE admin_hotels ADD COLUMN hotel_name TEXT DEFAULT ''`) } catch {}
+
+// Создаём admin пользователя если нет
+function hashPassword(pw) {
+  return crypto.createHash('sha256').update(pw).digest('hex')
+}
+const existingAdmin = db.prepare('SELECT id FROM admin_users WHERE username = ?').get('admin')
+if (!existingAdmin) {
+  db.prepare('INSERT INTO admin_users (username, password_hash) VALUES (?, ?)').run('admin', hashPassword('turtur2026'))
+  console.log('Admin user created: admin / turtur2026')
+}
+
+// Middleware проверки токена
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  const token = authHeader.slice(7)
+  const session = db.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token)
+  if (!session) {
+    return res.status(401).json({ error: 'Invalid token' })
+  }
+  // Сессия живёт 24 часа
+  if (Date.now() - session.created_at > 24 * 60 * 60 * 1000) {
+    db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token)
+    return res.status(401).json({ error: 'Token expired' })
+  }
+  req.userId = session.user_id
+  next()
+}
+
+// === AUTH ENDPOINTS ===
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password required' })
+  }
+  const user = db.prepare('SELECT * FROM admin_users WHERE username = ?').get(username)
+  if (!user || user.password_hash !== hashPassword(password)) {
+    return res.status(401).json({ error: 'Invalid credentials' })
+  }
+  const token = crypto.randomBytes(32).toString('hex')
+  db.prepare('INSERT INTO admin_sessions (token, user_id, created_at) VALUES (?, ?, ?)').run(token, user.id, Date.now())
+  res.json({ success: true, token })
+})
+
+app.post('/api/admin/logout', requireAuth, (req, res) => {
+  const token = req.headers.authorization.slice(7)
+  db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token)
+  res.json({ success: true })
+})
+
+app.get('/api/admin/check', requireAuth, (req, res) => {
+  res.json({ success: true })
+})
+
+// === ADMIN HOTELS CRUD ===
+function parseHotelRow(row) {
+  return {
+    hotelId: row.hotel_id,
+    hotelName: row.hotel_name || '',
+    isSpecial: !!row.is_special,
+    reviewsUrl: row.reviews_url,
+    customDescription: row.custom_description,
+    customTags: JSON.parse(row.custom_tags || '[]'),
+    pros: JSON.parse(row.pros || '[]'),
+    cons: JSON.parse(row.cons || '[]'),
+    quotes: JSON.parse(row.quotes || '[]'),
+    touristPhotos: JSON.parse(row.tourist_photos || '[]')
+  }
+}
+
+app.get('/api/admin/hotels', requireAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM admin_hotels').all()
+  const hotels = {}
+  for (const row of rows) hotels[row.hotel_id] = parseHotelRow(row)
+  res.json({ success: true, hotels })
+})
+
+// Публичный эндпоинт — все данные без авторизации (для отображения на фронте)
+app.get('/api/admin/hotels/public', (req, res) => {
+  const rows = db.prepare('SELECT * FROM admin_hotels').all()
+  const hotels = {}
+  for (const row of rows) hotels[row.hotel_id] = parseHotelRow(row)
+  // Также отдаём категории и пресеты тегов
+  const categories = db.prepare('SELECT * FROM procon_categories ORDER BY id').all()
+  const tagPresets = db.prepare('SELECT * FROM tag_presets ORDER BY id').all()
+  res.json({ success: true, hotels, categories, tagPresets })
+})
+
+app.post('/api/admin/hotels', requireAuth, (req, res) => {
+  const { hotelId, hotelName, isSpecial, reviewsUrl, customDescription, customTags, pros, cons, quotes } = req.body
+  if (!hotelId) return res.status(400).json({ error: 'hotelId required' })
+  db.prepare(`
+    INSERT INTO admin_hotels (hotel_id, hotel_name, is_special, reviews_url, custom_description, custom_tags, pros, cons, quotes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(hotel_id) DO UPDATE SET
+      hotel_name = excluded.hotel_name,
+      is_special = excluded.is_special,
+      reviews_url = excluded.reviews_url,
+      custom_description = excluded.custom_description,
+      custom_tags = excluded.custom_tags,
+      pros = excluded.pros,
+      cons = excluded.cons,
+      quotes = excluded.quotes
+  `).run(
+    String(hotelId),
+    (hotelName || '').trim(),
+    isSpecial ? 1 : 0,
+    reviewsUrl || '',
+    customDescription || '',
+    JSON.stringify(customTags || []),
+    JSON.stringify(pros || []),
+    JSON.stringify(cons || []),
+    JSON.stringify(quotes || [])
+  )
+  res.json({ success: true })
+})
+
+// === ЗАГРУЗКА ФОТОГРАФИЙ ТУРИСТОВ ===
+app.post('/api/admin/hotels/:id/tourist-photos', requireAuth, upload.array('photos', 20), (req, res) => {
+  const hotelId = req.params.id
+  const row = db.prepare('SELECT tourist_photos FROM admin_hotels WHERE hotel_id = ?').get(hotelId)
+  const existing = JSON.parse(row?.tourist_photos || '[]')
+  const newPhotos = (req.files || []).map(f => ({
+    id: crypto.randomBytes(8).toString('hex'),
+    url: `/uploads/tourist-photos/${f.filename}`,
+    filename: f.filename
+  }))
+  const updated = [...existing, ...newPhotos]
+  db.prepare('UPDATE admin_hotels SET tourist_photos = ? WHERE hotel_id = ?').run(JSON.stringify(updated), hotelId)
+  res.json({ success: true, photos: updated })
+})
+
+app.delete('/api/admin/hotels/:id/tourist-photos/:photoId', requireAuth, (req, res) => {
+  const { id: hotelId, photoId } = req.params
+  const row = db.prepare('SELECT tourist_photos FROM admin_hotels WHERE hotel_id = ?').get(hotelId)
+  const photos = JSON.parse(row?.tourist_photos || '[]')
+  const photo = photos.find(p => p.id === photoId)
+  if (photo) {
+    const filePath = path.join(__dirname, photo.url)
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  }
+  const updated = photos.filter(p => p.id !== photoId)
+  db.prepare('UPDATE admin_hotels SET tourist_photos = ? WHERE hotel_id = ?').run(JSON.stringify(updated), hotelId)
+  res.json({ success: true, photos: updated })
+})
+
+app.delete('/api/admin/hotels/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM admin_hotels WHERE hotel_id = ?').run(req.params.id)
+  res.json({ success: true })
+})
+
+// === PROCON CATEGORIES CRUD ===
+app.get('/api/admin/categories', requireAuth, (req, res) => {
+  const categories = db.prepare('SELECT * FROM procon_categories ORDER BY id').all()
+  res.json({ success: true, categories })
+})
+
+app.post('/api/admin/categories', requireAuth, (req, res) => {
+  const { name, icon } = req.body
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name required' })
+  const result = db.prepare('INSERT INTO procon_categories (name, icon) VALUES (?, ?)').run(name.trim(), (icon || '').trim())
+  res.json({ success: true, id: result.lastInsertRowid })
+})
+
+app.put('/api/admin/categories/:id', requireAuth, (req, res) => {
+    const { name, icon } = req.body
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name required' })
+    db.prepare('UPDATE procon_categories SET name = ?, icon = ? WHERE id = ?').run(name.trim(), (icon || '').trim(), req.params.id)
+    res.json({ success: true })
+})
+
+app.delete('/api/admin/categories/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM procon_categories WHERE id = ?').run(req.params.id)
+  res.json({ success: true })
+})
+
+// === TAG PRESETS CRUD ===
+app.get('/api/admin/tag-presets', requireAuth, (req, res) => {
+  const presets = db.prepare('SELECT * FROM tag_presets ORDER BY id').all()
+  res.json({ success: true, presets })
+})
+
+app.post('/api/admin/tag-presets', requireAuth, (req, res) => {
+  const { name, icon, color } = req.body
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name required' })
+  const result = db.prepare('INSERT INTO tag_presets (name, icon, color) VALUES (?, ?, ?)').run(
+    name.trim(),
+    (icon || '').trim(),
+    (color || '#0891b2').trim()
+  )
+  res.json({ success: true, id: result.lastInsertRowid })
+})
+
+app.put('/api/admin/tag-presets/:id', requireAuth, (req, res) => {
+    const { name, icon, color } = req.body
+    if (!name || !name.trim()) return res.status(400).json({ error: 'name required' })
+    db.prepare('UPDATE tag_presets SET name = ?, icon = ?, color = ? WHERE id = ?').run(
+        name.trim(),
+        (icon || '').trim(),
+        (color || '#0891b2').trim(),
+        req.params.id
+    )
+    res.json({ success: true })
+})
+
+app.delete('/api/admin/tag-presets/:id', requireAuth, (req, res) => {
+  db.prepare('DELETE FROM tag_presets WHERE id = ?').run(req.params.id)
+  res.json({ success: true })
+})
+
 // API ключ Level.Travel (нужно заменить на реальный)
 const RAW_KEY = '61c4f62cef9bf005789f63624ad8fb4b'
 const LT_API_KEY = RAW_KEY.trim()
@@ -266,8 +572,122 @@ app.get('/api/tours', async (req, res) => {
     }
 });
 
+// === EXCURSIONS CRUD ===
+function parseExcursionRow(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    photos: JSON.parse(row.photos || '[]'),
+    regions: JSON.parse(row.regions || '[]'),
+    section: row.section || 'historical',
+    priceUsd: row.price_usd || 0,
+    duration: row.duration || '',
+    shortDescription: row.short_description || '',
+    fullDescription: row.full_description || '',
+    isRecommended: !!row.is_recommended,
+    isNearby: !!row.is_nearby,
+    createdAt: row.created_at || 0
+  }
+}
+
+// Public list (for frontend)
+app.get('/api/excursions', (req, res) => {
+  const rows = db.prepare('SELECT * FROM excursions ORDER BY created_at DESC').all()
+  res.json({ success: true, excursions: rows.map(parseExcursionRow) })
+})
+
+// Admin list
+app.get('/api/admin/excursions', requireAuth, (req, res) => {
+  const rows = db.prepare('SELECT * FROM excursions ORDER BY created_at DESC').all()
+  res.json({ success: true, excursions: rows.map(parseExcursionRow) })
+})
+
+// Create / Update excursion
+app.post('/api/admin/excursions', requireAuth, (req, res) => {
+  const { id, title, regions, section, priceUsd, duration, shortDescription, fullDescription, isRecommended, isNearby } = req.body
+  if (!title || !title.trim()) return res.status(400).json({ error: 'title required' })
+
+  if (id) {
+    db.prepare(`UPDATE excursions SET title=?, regions=?, section=?, price_usd=?, duration=?, short_description=?, full_description=?, is_recommended=?, is_nearby=? WHERE id=?`).run(
+      title.trim(), JSON.stringify(regions || []), section || 'historical', priceUsd || 0, (duration || '').trim(),
+      (shortDescription || '').trim(), (fullDescription || '').trim(), isRecommended ? 1 : 0, isNearby ? 1 : 0, id
+    )
+    res.json({ success: true, id })
+  } else {
+    const result = db.prepare(`INSERT INTO excursions (title, regions, section, price_usd, duration, short_description, full_description, is_recommended, is_nearby, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      title.trim(), JSON.stringify(regions || []), section || 'historical', priceUsd || 0, (duration || '').trim(),
+      (shortDescription || '').trim(), (fullDescription || '').trim(), isRecommended ? 1 : 0, isNearby ? 1 : 0, Date.now()
+    )
+    res.json({ success: true, id: result.lastInsertRowid })
+  }
+})
+
+// Upload excursion photos
+app.post('/api/admin/excursions/:id/photos', requireAuth, (req, res, next) => {
+  req._uploadDest = excursionUploadsDir
+  next()
+}, upload.array('photos', 20), (req, res) => {
+  const excId = req.params.id
+  const row = db.prepare('SELECT photos FROM excursions WHERE id = ?').get(excId)
+  if (!row) return res.status(404).json({ error: 'Excursion not found' })
+  const existing = JSON.parse(row.photos || '[]')
+  const newPhotos = (req.files || []).map(f => ({
+    id: crypto.randomBytes(8).toString('hex'),
+    url: `/uploads/excursion-photos/${f.filename}`,
+    filename: f.filename
+  }))
+  const updated = [...existing, ...newPhotos]
+  db.prepare('UPDATE excursions SET photos = ? WHERE id = ?').run(JSON.stringify(updated), excId)
+  res.json({ success: true, photos: updated })
+})
+
+// Delete excursion photo
+app.delete('/api/admin/excursions/:id/photos/:photoId', requireAuth, (req, res) => {
+  const { id: excId, photoId } = req.params
+  const row = db.prepare('SELECT photos FROM excursions WHERE id = ?').get(excId)
+  if (!row) return res.status(404).json({ error: 'Excursion not found' })
+  const photos = JSON.parse(row.photos || '[]')
+  const photo = photos.find(p => p.id === photoId)
+  if (photo) {
+    const filePath = path.join(__dirname, photo.url)
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  }
+  const updated = photos.filter(p => p.id !== photoId)
+  db.prepare('UPDATE excursions SET photos = ? WHERE id = ?').run(JSON.stringify(updated), excId)
+  res.json({ success: true, photos: updated })
+})
+
+// Reorder excursion photos
+app.put('/api/admin/excursions/:id/photos/reorder', requireAuth, (req, res) => {
+  const excId = req.params.id
+  const { photoIds } = req.body
+  if (!Array.isArray(photoIds)) return res.status(400).json({ error: 'photoIds must be an array' })
+  const row = db.prepare('SELECT photos FROM excursions WHERE id = ?').get(excId)
+  if (!row) return res.status(404).json({ error: 'Excursion not found' })
+  const photos = JSON.parse(row.photos || '[]')
+  const reordered = photoIds.map(id => photos.find(p => p.id === id)).filter(Boolean)
+  // Add any photos not in the reorder list at the end
+  photos.forEach(p => { if (!photoIds.includes(p.id)) reordered.push(p) })
+  db.prepare('UPDATE excursions SET photos = ? WHERE id = ?').run(JSON.stringify(reordered), excId)
+  res.json({ success: true, photos: reordered })
+})
+
+// Delete excursion
+app.delete('/api/admin/excursions/:id', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT photos FROM excursions WHERE id = ?').get(req.params.id)
+  if (row) {
+    const photos = JSON.parse(row.photos || '[]')
+    photos.forEach(p => {
+      const filePath = path.join(__dirname, p.url)
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+    })
+  }
+  db.prepare('DELETE FROM excursions WHERE id = ?').run(req.params.id)
+  res.json({ success: true })
+})
+
 // === ЗАПУСК СЕРВЕРА ===
-app.listen(3000, () => console.log('Backend v5.0 Ready with Full Data Mapping'));
+app.listen(3000, () => console.log('Backend v6.0 Ready with Excursions'));
 
 // === ENDPOINT ДЕТАЛЬНОЙ ИНФОРМАЦИИ ОБ ОТЕЛЕ ===
 app.get('/api/hotel/:id', async (req, res) => {
@@ -396,6 +816,20 @@ app.get('/api/hotel/:id', async (req, res) => {
             
             amenities: amenities,
             
+            // Поля для тегов (совместимость с /api/tours)
+            beach_line: features.line ? `${features.line}-я линия` : "",
+            sandy_beach: features.sandy_beach || false,
+            pebble_beach: features.pebble_beach || false,
+            meal_label: features.ultra_all_inclusive ? "Ultra All Inclusive" : (features.all_inclusive ? "All Inclusive" : ""),
+            has_aquapark: !!features.aquapark,
+            is_family: !!(features.kids_club || features.kids_pool || features.kids_menu || features.playground),
+            wifi_status: features.wi_fi ? (features.wi_fi === 'LOBBY_FREE' ? "В лобби" : "Бесплатный Wi-Fi") : "",
+            special: {
+                adults_only: !!hotel.adults_only,
+                is_new_hotel: latestYear >= 2024,
+                display_year: latestYear > 0 ? latestYear : null
+            },
+
             info: {
                 build_year: buildYear > 0 ? buildYear : null,
                 renovation_year: renovationYear > 0 ? renovationYear : null,
@@ -575,18 +1009,32 @@ app.get('/api/hotel/:id/rooms-matrix', async (req, res) => {
     try {
         console.log(`[matrix-sse] Enqueuing ${nightsList.length} searches for hotel ${hotelId}, date ${date}`);
 
-        // Step 1: Enqueue ALL searches in parallel
-        const enqueueResults = await Promise.all(
-            nightsList.map(n =>
-                ltApi.get('/search/enqueue', {
-                    params: {
-                        from_city: fromCity, to_country: 'TR', to_city: toCity,
-                        adults: adultsNum, start_date: date,
-                        nights: String(n), hotel_ids: hotelId
+        // Step 1: Enqueue ALL searches in parallel (with retries)
+        const enqueueWithRetry = async (n, maxAttempts = 3) => {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    const r = await ltApi.get('/search/enqueue', {
+                        params: {
+                            from_city: fromCity, to_country: 'TR', to_city: toCity,
+                            adults: adultsNum, start_date: date,
+                            nights: String(n), hotel_ids: hotelId
+                        }
+                    });
+                    if (r.data?.request_id) {
+                        return { nights: n, requestId: r.data.request_id, done: false, sent: false };
                     }
-                }).then(r => ({ nights: n, requestId: r.data.request_id, done: false, sent: false }))
-                  .catch(() => ({ nights: n, requestId: null, done: true, sent: true }))
-            )
+                } catch (e) {
+                    if (attempt === maxAttempts) {
+                        console.warn(`[matrix-sse] Enqueue failed for ${n} nights after ${maxAttempts} attempts`);
+                    }
+                }
+                await new Promise(r => setTimeout(r, 350));
+            }
+            return { nights: n, requestId: null, done: true, sent: false };
+        };
+
+        const enqueueResults = await Promise.all(
+            nightsList.map(n => enqueueWithRetry(n, n === baseNights ? 4 : 3))
         );
 
         if (aborted) return res.end();
@@ -614,6 +1062,12 @@ app.get('/api/hotel/:id/rooms-matrix', async (req, res) => {
         }
 
         if (aborted) return res.end();
+
+        // Mark failed enqueues as loaded to prevent endless skeletons on frontend.
+        for (const failed of enqueueResults.filter(s => !s.requestId && !s.sent)) {
+            failed.sent = true;
+            sendSSE('night-data', { night: failed.nights, offers: [] });
+        }
 
         // Step 3: Poll loop — stream each night's data as it completes
         // Reorder: base night first for priority
@@ -670,46 +1124,54 @@ app.get('/api/hotel/:id/rooms-matrix', async (req, res) => {
             return flat.filter(o => Number.isFinite(o.price));
         };
 
-        for (let attempt = 0; attempt < 15; attempt++) {
-            if (aborted) return res.end();
-            await new Promise(r => setTimeout(r, 2500));
-            if (aborted) return res.end();
-
-            // Check all statuses in parallel
-            const statusResults = await Promise.all(
-                validSearches.map(s => {
-                    if (s.done) return Promise.resolve(true);
-                    return ltApi.get('/search/status', { params: { request_id: s.requestId } })
-                        .then(r => !Object.values(r.data.status || {}).some(st => st === 'pending' || st === 'performing'))
-                        .catch(() => true);
-                })
-            );
-
-            // Fetch and stream offers for newly completed searches
-            for (let i = 0; i < validSearches.length; i++) {
-                const s = validSearches[i];
-                if (statusResults[i] && !s.done) {
-                    s.done = true;
+        // Helper: poll a single search until done, fetch and send its data
+        const pollAndSend = async (search, maxAttempts = 15) => {
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                if (aborted || search.sent) return;
+                await new Promise(r => setTimeout(r, 1500));
+                if (aborted) return;
+                if (!search.done) {
+                    try {
+                        const statusRes = await ltApi.get('/search/status', { params: { request_id: search.requestId } });
+                        const pending = Object.values(statusRes.data.status || {}).some(st => st === 'pending' || st === 'performing');
+                        if (!pending) search.done = true;
+                    } catch { search.done = true; }
                 }
-                if (s.done && !s.sent && !aborted) {
+                if (search.done && !search.sent) {
                     try {
                         const r = await ltApi.get('/search/hotel_rooms', {
-                            params: { request_id: s.requestId, hotel_id: hotelId }
+                            params: { request_id: search.requestId, hotel_id: hotelId }
                         });
-                        const offers = flattenHotelRooms(r.data, s.nights);
-                        s.sent = true;
-                        console.log(`[matrix-sse] Night ${s.nights}: ${offers.length} offers`);
-                        sendSSE('night-data', { night: s.nights, offers });
+                        const offers = flattenHotelRooms(r.data, search.nights);
+                        search.sent = true;
+                        console.log(`[matrix-sse] Night ${search.nights}: ${offers.length} offers`);
+                        sendSSE('night-data', { night: search.nights, offers });
                     } catch (e) {
-                        s.sent = true;
-                        sendSSE('night-data', { night: s.nights, offers: [] });
+                        search.sent = true;
+                        sendSSE('night-data', { night: search.nights, offers: [] });
                     }
+                    return;
                 }
             }
+            // Timed out — send empty
+            if (!search.sent) {
+                search.sent = true;
+                sendSSE('night-data', { night: search.nights, offers: [] });
+            }
+        };
 
-            const doneCount = validSearches.filter(s => s.sent).length;
-            console.log(`[matrix-sse] Poll ${attempt + 1}: ${doneCount}/${validSearches.length} sent`);
-            if (validSearches.every(s => s.sent)) break;
+        // Phase 1: Poll ONLY the base night first
+        const baseNightSearch = validSearches.find(s => s.nights === baseNights);
+        if (baseNightSearch && !aborted) {
+            console.log(`[matrix-sse] Phase 1: waiting for base night ${baseNights}`);
+            await pollAndSend(baseNightSearch, 25);
+        }
+
+        // Phase 2: Poll remaining nights in parallel
+        if (!aborted) {
+            const remaining = validSearches.filter(s => !s.sent);
+            console.log(`[matrix-sse] Phase 2: loading ${remaining.length} remaining nights`);
+            await Promise.all(remaining.map(s => pollAndSend(s)));
         }
 
         sendSSE('complete', {});

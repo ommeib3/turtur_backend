@@ -4,9 +4,6 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-admin.db
-admin.db-shm
-admin.db-wal
 uploads/
 
 .DS_Store
